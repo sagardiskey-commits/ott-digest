@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "OTT digest · Mon 28 Sep – Sun 11 Oct 2026";
+const APP_NAME = "OTT digest · Weekly Cinema & Streaming Guide";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -14,7 +14,7 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "Bollywood, South Indian, English and British premieres from Monday 28 September through Sunday 11 October 2026. Anime excluded.",
+          "Weekly cinema and streaming release list across English, British, Hindi, and South Indian titles. Anime and reality TV excluded.",
       },
       { name: "theme-color", content: "#0f0f12" },
     ],

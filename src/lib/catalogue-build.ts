@@ -1,4 +1,5 @@
-import { REGION_LABEL, type Region, type Release } from "@/data/releases";
+import { REGION_LABEL, type Region, type Release } from "../data/releases.ts";
+import { primeRatingCache } from "./rating-cache.ts";
 
 export type WeekBand = { id: 1 | 2; label: string; hint: string };
 
@@ -9,6 +10,8 @@ export type CatalogueResult = {
   zone: string;
   country: string;
   countryName: string;
+  todayKey: string;
+  updatedAt: string;
 };
 
 const MONTHS = [
@@ -45,6 +48,7 @@ type MovieHit = {
   title: string;
   date: string;
   poster?: string;
+  genres?: string[];
   sources: Set<string>;
   onMovie: boolean;
   onTv: boolean;
@@ -96,15 +100,16 @@ function localDateParts(now: Date, timeZone: string) {
   return { year: pick("year"), month: pick("month"), day: pick("day") };
 }
 
-function windowBounds(now: Date, timeZone: string) {
+export function windowBounds(now: Date, timeZone: string) {
   const { year, month, day } = localDateParts(now, timeZone);
   const today = new Date(Date.UTC(year, month - 1, day));
   const dow = today.getUTCDay();
+  const todayWeekday = dow === 0 ? 6 : dow - 1;
   const start = new Date(today);
-  start.setUTCDate(today.getUTCDate() + (dow === 0 ? -6 : 1 - dow));
+  start.setUTCDate(today.getUTCDate() - todayWeekday);
   const end = new Date(start);
   end.setUTCDate(start.getUTCDate() + 13);
-  return { start, end };
+  return { start, end, today, todayWeekday };
 }
 
 function iso(date: Date) {
@@ -151,11 +156,11 @@ function plain(html: string | null | undefined) {
   if (!html) return "";
   return html
     .replace(/<[^>]+>/g, "")
-    .replace(/&/g, "&")
-    .replace(/"/g, '"')
-    .replace(/&#39;|'/g, "'")
-    .replace(/</g, "<")
-    .replace(/>/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -208,19 +213,19 @@ function isAnime(genres: string[] | undefined, language: string | undefined, cou
 
 function isReality(type: string | undefined, genres: string[] | undefined) {
   if (/reality/i.test(type ?? "")) return true;
-  return (genres ?? []).some((genre) => /reality/i.test(genre));
+  return (genres ?? []).some((genre) => /reality|game-show|talk-show/i.test(genre));
 }
 
-async function readText(url: string) {
+async function readText(url: string, timeoutMs = 15000) {
   const response = await fetch(url, {
     headers: { accept: "text/plain", "user-agent": "Mozilla/5.0" },
-    signal: AbortSignal.timeout(20000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!response.ok) throw new Error(String(response.status));
   return response.text();
 }
 
-function parseCalendar(markdown: string, source: string, kind: "movie" | "series") {
+export function parseCalendar(markdown: string, source: string, kind: "movie" | "series") {
   let date: string | null = null;
   let poster: string | undefined;
   const hits: MovieHit[] = [];
@@ -249,11 +254,90 @@ function parseCalendar(markdown: string, source: string, kind: "movie" | "series
   return hits;
 }
 
+function parseImdbCalendarNextData(
+  html: string,
+  source: string,
+  kind: "movie" | "series",
+): MovieHit[] | null {
+  const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/i);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1]) as {
+      props?: {
+        pageProps?: {
+          groups?: {
+            date?: string;
+            entries?: {
+              id?: string;
+              titleText?: string;
+              releaseDate?: { year?: number; month?: number; day?: number };
+              imageModel?: { url?: string };
+              genres?: string[];
+            }[];
+          }[];
+        };
+      };
+    };
+    const groups = parsed?.props?.pageProps?.groups;
+    if (!Array.isArray(groups) || groups.length === 0) return null;
+    const hits: MovieHit[] = [];
+    for (const group of groups) {
+      for (const entry of group.entries ?? []) {
+        const tt = entry.id?.match(/^tt\d+$/)?.[0];
+        const title = entry.titleText ? cleanTitle(entry.titleText) : "";
+        const rel = entry.releaseDate;
+        const date =
+          rel?.year && rel?.month && rel?.day
+            ? `${rel.year}-${String(rel.month).padStart(2, "0")}-${String(rel.day).padStart(2, "0")}`
+            : group.date && /^\d{4}-\d{2}-\d{2}$/.test(group.date)
+              ? group.date
+              : null;
+        if (!tt || !title || !date) continue;
+        hits.push({
+          tt,
+          title,
+          date,
+          poster: largerPoster(entry.imageModel?.url),
+          genres: entry.genres,
+          sources: new Set([source]),
+          onMovie: kind === "movie",
+          onTv: kind === "series",
+        });
+      }
+    }
+    return hits.length > 0 ? hits : null;
+  } catch {
+    return null;
+  }
+}
+
 async function imdbCalendar(source: string, type: "MOVIE" | "TV") {
+  const kind = type === "MOVIE" ? "movie" : "series";
+  try {
+    const response = await fetch(
+      `https://www.imdb.com/calendar/?region=${source}&type=${type}`,
+      {
+        headers: {
+          accept: "text/html,application/xhtml+xml",
+          "accept-language": "en-US,en;q=0.9",
+          "user-agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        },
+        signal: AbortSignal.timeout(10000),
+      },
+    );
+    if (response.ok) {
+      const html = await response.text();
+      const direct = parseImdbCalendarNextData(html, source, kind);
+      if (direct && direct.length > 0) return direct;
+    }
+  } catch {
+    // Fall back to Jina reader below.
+  }
   const markdown = await readText(
     `https://r.jina.ai/https://www.imdb.com/calendar/?region=${source}&type=${type}`,
   );
-  return parseCalendar(markdown, source, type === "MOVIE" ? "movie" : "series");
+  return parseCalendar(markdown, source, kind);
 }
 
 function looseDate(text: string) {
@@ -382,6 +466,7 @@ type MazeShow = {
   language: string | null;
   genres: string[];
   summary: string | null;
+  rating?: { average?: number | null };
   image: { original?: string } | null;
   network: { name: string; country?: { code?: string; name?: string } | null } | null;
   webChannel: { name: string; country?: { code?: string; name?: string } | null } | null;
@@ -395,12 +480,11 @@ async function streamingPremieres(start: Date, end: Date) {
   }
   const rows: Release[] = [];
   const seen = new Set<string>();
-  for (let index = 0; index < days.length; index += 7) {
-    const chunk = days.slice(index, index + 7);
-    const lists = await Promise.all(
-      chunk.map(async (date) => {
+  const lists = await Promise.all(
+    days.map(async (date) => {
+      try {
         const response = await fetch(`https://api.tvmaze.com/schedule/web?date=${date}`, {
-          signal: AbortSignal.timeout(15000),
+          signal: AbortSignal.timeout(12000),
         });
         if (!response.ok) return [];
         return (await response.json()) as {
@@ -410,54 +494,80 @@ async function streamingPremieres(start: Date, end: Date) {
           image: { original?: string } | null;
           _embedded?: { show?: MazeShow };
         }[];
-      }),
-    );
-    for (const list of lists) {
-      for (const episode of list) {
-        if (episode.number !== 1) continue;
-        const show = episode._embedded?.show;
-        if (!show) continue;
-        if (isReality(show.type, show.genres)) continue;
-        const country = show.webChannel?.country?.name || show.network?.country?.name || "";
-        if (isAnime(show.genres, show.language ?? "", country)) continue;
-        if (!show.webChannel?.name) continue;
-        const code = show.webChannel.country?.code || "";
-        let region = regionFromLanguage(show.language ?? "", country);
-        if (region === "english" && code === "GB") region = "british";
-        if (!region) continue;
-        const tt = show.externals?.imdb || "";
-        const id = tt ? tt : `tvmaze-${show.id}-s${episode.season}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const date = episode.airdate;
-        const platform = show.webChannel.name;
-        const blurb =
-          plain(show.summary) ||
-          `${show.name} season ${episode.season} premieres on ${platform}.`;
-        rows.push({
-          id,
-          title: show.name,
-          week: date < iso(addDays(start, 7)) ? 1 : 2,
-          weekday: weekdayIndex(date),
-          day: dayLabel(date),
-          kind: "series",
-          region,
-          place: "streaming",
-          platform,
-          blurb,
-          imdb: tt ? `https://www.imdb.com/title/${tt}/` : undefined,
-          poster: show.image?.original || episode.image?.original,
-        });
+      } catch {
+        return [];
       }
+    }),
+  );
+
+  for (const list of lists) {
+    for (const episode of list) {
+      if (episode.number !== 1) continue;
+      const show = episode._embedded?.show;
+      if (!show) continue;
+      if (isReality(show.type, show.genres)) continue;
+      const country = show.webChannel?.country?.name || show.network?.country?.name || "";
+      if (isAnime(show.genres, show.language ?? "", country)) continue;
+      if (!show.webChannel?.name) continue;
+      const code = show.webChannel.country?.code || "";
+      let region = regionFromLanguage(show.language ?? "", country);
+      if (region === "english" && code === "GB") region = "british";
+      if (!region) continue;
+      const tt = show.externals?.imdb || "";
+      const id = tt ? tt : `tvmaze-${show.id}-s${episode.season}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const date = episode.airdate;
+      const channelName = show.webChannel.name;
+      const platform =
+        episode.season >= 1 ? `${channelName} · Season ${episode.season}` : channelName;
+      const blurb =
+        plain(show.summary) ||
+        `${show.name} season ${episode.season} premieres on ${channelName}.`;
+      const avgRating =
+        typeof show.rating?.average === "number" && show.rating.average > 0
+          ? show.rating.average.toFixed(1)
+          : undefined;
+      rows.push({
+        id,
+        title: show.name,
+        week: date < iso(addDays(start, 7)) ? 1 : 2,
+        weekday: weekdayIndex(date),
+        day: dayLabel(date),
+        kind: "series",
+        region,
+        place: "streaming",
+        platform,
+        blurb,
+        imdb: tt ? `https://www.imdb.com/title/${tt}/` : undefined,
+        rating: avgRating,
+        poster: show.image?.original || episode.image?.original,
+      });
     }
   }
   return rows;
 }
 
+const omdbMemo = new Map<
+  string,
+  {
+    Response?: string;
+    Error?: string;
+    Language?: string;
+    Country?: string;
+    Genre?: string;
+    Plot?: string;
+    Poster?: string;
+    Type?: string;
+    imdbRating?: string;
+  } | null
+>();
+
 async function omdb(tt: string) {
+  if (omdbMemo.has(tt)) return omdbMemo.get(tt) ?? null;
   const response = await fetch(
     `https://www.omdbapi.com/?apikey=trilogy&i=${tt}&plot=short`,
-    { signal: AbortSignal.timeout(12000) },
+    { signal: AbortSignal.timeout(10000) },
   );
   if (!response.ok) return null;
   const data = (await response.json()) as {
@@ -469,54 +579,77 @@ async function omdb(tt: string) {
     Plot?: string;
     Poster?: string;
     Type?: string;
+    imdbRating?: string;
   };
-  if (data.Response === "False") return data.Error === "Request limit reached!" ? "limit" : null;
+  if (data.Response === "False") {
+    return data.Error === "Request limit reached!" ? "limit" : null;
+  }
+  if (data.imdbRating && /^\d\.\d$/.test(data.imdbRating)) {
+    primeRatingCache(tt, data.imdbRating);
+  }
+  omdbMemo.set(tt, data);
   return data;
 }
 
 async function fillPosters(releases: Release[]) {
-  const need = releases.filter((item) => !item.poster && item.imdb);
-  for (let index = 0; index < need.length; index += 6) {
-    const chunk = need.slice(index, index + 6);
+  const need = releases.filter((item) => (!item.poster || !item.rating) && item.imdb);
+  for (let index = 0; index < need.length; index += 8) {
+    const chunk = need.slice(index, index + 8);
     await Promise.all(
       chunk.map(async (item) => {
         const tt = item.imdb?.match(/tt\d+/)?.[0];
         if (!tt) return;
         const meta = await omdb(tt).catch(() => null);
         if (!meta || meta === "limit") return;
-        if (meta.Poster && meta.Poster !== "N/A") item.poster = largerPoster(meta.Poster);
+        if (!item.poster && meta.Poster && meta.Poster !== "N/A") {
+          item.poster = largerPoster(meta.Poster);
+        }
+        if (!item.rating && meta.imdbRating && /^\d\.\d$/.test(meta.imdbRating)) {
+          item.rating = meta.imdbRating;
+        }
       }),
     );
   }
-  for (const item of releases) {
-    if (item.poster) continue;
-    const maze = item.id.match(/^tvmaze-(\d+)/);
-    if (!maze) continue;
-    try {
-      const response = await fetch(`https://api.tvmaze.com/shows/${maze[1]}/images`, {
-        signal: AbortSignal.timeout(12000),
-      });
-      if (!response.ok) continue;
-      const images = (await response.json()) as {
-        type?: string;
-        resolutions?: { original?: { url?: string } };
-      }[];
-      const shot = images.find((image) => image.type === "poster") ?? images[0];
-      const url = shot?.resolutions?.original?.url;
-      if (url) item.poster = url;
-    } catch {
-      // Leave the letter tile if the show has no artwork.
-    }
-  }
+  const missingTvmaze = releases.filter((item) => !item.poster && /^tvmaze-(\d+)/.test(item.id));
+  await Promise.all(
+    missingTvmaze.map(async (item) => {
+      const maze = item.id.match(/^tvmaze-(\d+)/);
+      if (!maze) return;
+      try {
+        const response = await fetch(`https://api.tvmaze.com/shows/${maze[1]}/images`, {
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!response.ok) return;
+        const images = (await response.json()) as {
+          type?: string;
+          resolutions?: { original?: { url?: string } };
+        }[];
+        const shot = images.find((image) => image.type === "poster") ?? images[0];
+        const url = shot?.resolutions?.original?.url;
+        if (url) item.poster = url;
+      } catch {
+        // Leave the letter tile if the show has no artwork.
+      }
+    }),
+  );
 }
 
-async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, userCountry: string) {
-  const groups = await Promise.all([
+async function rawImdbCalendars(userCountry: string) {
+  return Promise.all([
     imdbCalendar(userCountry, "MOVIE").catch(() => [] as MovieHit[]),
     ...(["US", "GB", "IN"] as const).map((source) =>
       imdbCalendar(source, "TV").catch(() => [] as MovieHit[]),
     ),
   ]);
+}
+
+async function filmsFromCalendarGroups(
+  groups: MovieHit[][],
+  start: Date,
+  end: Date,
+  taken: Set<string>,
+  userCountry: string,
+) {
   const byId = new Map<string, MovieHit>();
   for (const hit of groups.flat()) {
     if (hit.date < iso(start) || hit.date > iso(end)) continue;
@@ -528,6 +661,7 @@ async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, us
     }
     for (const source of hit.sources) existing.sources.add(source);
     if (!existing.poster && hit.poster) existing.poster = hit.poster;
+    if (!existing.genres && hit.genres) existing.genres = hit.genres;
     existing.onMovie = existing.onMovie || hit.onMovie;
     existing.onTv = existing.onTv || hit.onTv;
   }
@@ -535,9 +669,9 @@ async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, us
   const hits = [...byId.values()];
   const info = new Map<string, Awaited<ReturnType<typeof omdb>>>();
   let limited = false;
-  for (let index = 0; index < hits.length; index += 6) {
+  for (let index = 0; index < hits.length; index += 8) {
     if (limited) break;
-    const chunk = hits.slice(index, index + 6);
+    const chunk = hits.slice(index, index + 8);
     const rows = await Promise.all(
       chunk.map(async (hit) => [hit.tt, await omdb(hit.tt).catch(() => null)] as const),
     );
@@ -554,8 +688,9 @@ async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, us
   for (const hit of hits) {
     const meta = info.get(hit.tt);
     const details = meta && meta !== "limit" ? meta : null;
-    if (isReality(undefined, details?.Genre?.split(", "))) continue;
-    if (isAnime(details?.Genre?.split(", "), details?.Language, details?.Country)) continue;
+    const genres = details?.Genre?.split(", ") ?? hit.genres;
+    if (isReality(undefined, genres)) continue;
+    if (isAnime(genres, details?.Language, details?.Country)) continue;
     const theatrical = hit.onMovie;
     let described = describeTitle(details?.Language, details?.Country);
     if (!theatrical) {
@@ -574,7 +709,9 @@ async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, us
     }
     const plot = details?.Plot && details.Plot !== "N/A" ? details.Plot : "";
     const poster =
-      hit.poster || (details?.Poster && details.Poster !== "N/A" ? details.Poster : undefined);
+      hit.poster || (details?.Poster && details.Poster !== "N/A" ? largerPoster(details.Poster) : undefined);
+    const rating =
+      details?.imdbRating && /^\d\.\d$/.test(details.imdbRating) ? details.imdbRating : undefined;
     const tvMovie = !theatrical && details?.Type === "movie";
     const kind = theatrical || tvMovie ? "movie" : "series";
     const place = theatrical ? "cinema" : "streaming";
@@ -591,8 +728,13 @@ async function filmsFromCalendars(start: Date, end: Date, taken: Set<string>, us
       platform: theatrical ? "Cinemas" : "Television",
       blurb:
         plot ||
-        (theatrical ? "In cinemas this week." : kind === "movie" ? "Premieres on TV this week." : "New episode run this week."),
+        (theatrical
+          ? "In cinemas this week."
+          : kind === "movie"
+            ? "Premieres on TV this week."
+            : "New episode run this week."),
       imdb: `https://www.imdb.com/title/${hit.tt}/`,
+      rating,
       poster,
     });
   }
@@ -623,7 +765,7 @@ function cleanCell(value: string) {
     .trim();
 }
 
-function parseIndianTable(markdown: string) {
+export function parseIndianTable(markdown: string) {
   const found: {
     title: string;
     kind: "movie" | "series";
@@ -654,7 +796,7 @@ function parseIndianTable(markdown: string) {
   return found;
 }
 
-function parseIndianHeadings(markdown: string) {
+export function parseIndianHeadings(markdown: string) {
   const found: {
     title: string;
     kind: "movie" | "series";
@@ -741,7 +883,7 @@ async function matchImdb(title: string) {
     try {
       const response = await fetch(
         `https://v3.sg.media-imdb.com/suggestion/${key}/${encodeURIComponent(query)}.json`,
-        { signal: AbortSignal.timeout(12000) },
+        { signal: AbortSignal.timeout(10000) },
       );
       if (!response.ok) continue;
       const data = (await response.json()) as {
@@ -781,11 +923,49 @@ function pageSynopsis(text: string) {
 
 async function describeFromImdb(tt: string) {
   try {
-    const text = await readText(`https://r.jina.ai/https://www.imdb.com/title/${tt}/`);
-    const image = text.match(/\((https:\/\/m\.media-amazon\.com\/images\/M\/[^)]+)\)/);
-    return { blurb: pageSynopsis(text), poster: image ? largerPoster(image[1]) : undefined };
+    const response = await fetch(`https://www.imdb.com/title/${tt}/`, {
+      headers: {
+        accept: "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (response.ok) {
+      const html = await response.text();
+      const ldMatch = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/i);
+      if (ldMatch) {
+        const parsed = JSON.parse(ldMatch[1]) as {
+          description?: string;
+          image?: string;
+          aggregateRating?: { ratingValue?: number | string };
+        };
+        const ratingVal = parsed?.aggregateRating?.ratingValue;
+        const rating =
+          ratingVal !== undefined && ratingVal !== null ? Number(ratingVal).toFixed(1) : undefined;
+        if (rating) primeRatingCache(tt, rating);
+        return {
+          blurb: plain(parsed.description),
+          poster: largerPoster(parsed.image),
+          rating,
+        };
+      }
+    }
   } catch {
-    return { blurb: "", poster: undefined };
+    // Fall back to Jina reader below.
+  }
+
+  try {
+    const text = await readText(`https://r.jina.ai/https://www.imdb.com/title/${tt}/`, 12000);
+    const image = text.match(/\((https:\/\/m\.media-amazon\.com\/images\/M\/[^)]+)\)/);
+    return {
+      blurb: pageSynopsis(text),
+      poster: image ? largerPoster(image[1]) : undefined,
+      rating: undefined,
+    };
+  } catch {
+    return { blurb: "", poster: undefined, rating: undefined };
   }
 }
 
@@ -822,9 +1002,9 @@ async function indianOtt(start: Date, end: Date) {
           : `${language} film, streaming on ${row.platform} this week.`,
     });
   }
-  for (let index = 0; index < releases.length; index += 4) {
+  for (let index = 0; index < releases.length; index += 6) {
     await Promise.all(
-      releases.slice(index, index + 4).map(async (item) => {
+      releases.slice(index, index + 6).map(async (item) => {
         const match = await matchImdb(item.title);
         if (!match) return;
         item.id = match.id;
@@ -834,11 +1014,13 @@ async function indianOtt(start: Date, end: Date) {
         if (meta && meta !== "limit") {
           if (meta.Poster && meta.Poster !== "N/A") item.poster = largerPoster(meta.Poster);
           if (meta.Plot && meta.Plot !== "N/A") item.blurb = meta.Plot;
+          if (meta.imdbRating && /^\d\.\d$/.test(meta.imdbRating)) item.rating = meta.imdbRating;
         }
         if (item.poster && !item.blurb.startsWith("New ") && !item.blurb.endsWith("this week.")) return;
         const page = await describeFromImdb(match.id);
         if (!item.poster && page.poster) item.poster = page.poster;
         if (page.blurb) item.blurb = page.blurb;
+        if (!item.rating && page.rating) item.rating = page.rating;
       }),
     );
   }
@@ -849,31 +1031,41 @@ export async function buildCatalogue(
   now = new Date(),
   timeZone = "UTC",
   country = "US",
+  forceRefresh = false,
 ): Promise<CatalogueResult> {
   const zone = safeTimeZone(timeZone);
   const userCountry = safeCountry(country);
-  const { start, end } = windowBounds(now, zone);
-  const key = `${zone}:${userCountry}:${iso(start)}:indian-art`;
+  const { start, end, todayWeekday } = windowBounds(now, zone);
+  const key = `${zone}:${userCountry}:${iso(start)}:v2`;
   const saved = cache.get(key);
-  if (saved && Date.now() - saved.at < 3 * 60 * 60 * 1000) {
+  if (!forceRefresh && saved && Date.now() - saved.at < 3 * 60 * 60 * 1000) {
     return saved.data;
   }
 
-  const series = await streamingPremieres(start, end);
-  const tvMovies = await tvMoviePremieres(start, end, userCountry);
+  // Fetch all primary calendar sources concurrently instead of sequentially
+  const [series, tvMovies, calendarGroups, indian] = await Promise.all([
+    streamingPremieres(start, end),
+    tvMoviePremieres(start, end, userCountry),
+    rawImdbCalendars(userCountry),
+    indianOtt(start, end),
+  ]);
+
   const taken = new Set(
     [...series, ...tvMovies]
       .map((item) => item.imdb?.match(/tt\d+/)?.[0])
       .filter((id): id is string => Boolean(id)),
   );
-  const films = await filmsFromCalendars(start, end, taken, userCountry);
-  const indian = await indianOtt(start, end);
+  const films = await filmsFromCalendarGroups(calendarGroups, start, end, taken, userCountry);
   const names = new Set(
     [...series, ...tvMovies, ...films].map((item) => item.title.toLowerCase()),
   );
-  const releases = [...series, ...tvMovies, ...films, ...indian.filter((item) => !names.has(item.title.toLowerCase()))].sort((a, b) =>
-    a.week - b.week || a.weekday - b.weekday || a.title.localeCompare(b.title),
-  );
+  const releases = [
+    ...series,
+    ...tvMovies,
+    ...films,
+    ...indian.filter((item) => !names.has(item.title.toLowerCase())),
+  ].sort((a, b) => a.week - b.week || a.weekday - b.weekday || a.title.localeCompare(b.title));
+
   if (releases.length === 0) throw new Error("No releases found");
   await fillPosters(releases);
 
@@ -888,6 +1080,8 @@ export async function buildCatalogue(
     zone: zoneLabel(zone, now),
     country: userCountry,
     countryName: countryName(userCountry),
+    todayKey: `1-${todayWeekday}`,
+    updatedAt: now.toISOString(),
   };
   cache.set(key, { at: Date.now(), data });
   return data;

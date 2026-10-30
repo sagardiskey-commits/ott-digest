@@ -9,10 +9,13 @@ import {
 export type { CatalogueResult };
 
 export const getCatalogue = createServerFn({ method: "POST" })
-  .validator((data: { timeZone?: string; country?: string }) => ({
-    timeZone: safeTimeZone(data?.timeZone),
-    country: safeCountry(data?.country),
-  }))
+  .validator(
+    (data: { timeZone?: string; country?: string; forceRefresh?: boolean }) => ({
+      timeZone: safeTimeZone(data?.timeZone),
+      country: safeCountry(data?.country),
+      forceRefresh: Boolean(data?.forceRefresh),
+    }),
+  )
   .handler(async ({ data }): Promise<CatalogueResult> =>
-    buildCatalogue(new Date(), data.timeZone, data.country),
+    buildCatalogue(new Date(), data.timeZone, data.country, data.forceRefresh),
   );
