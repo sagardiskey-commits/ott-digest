@@ -414,22 +414,27 @@ function Home() {
   }, [releases]);
 
   const availableRegions = useMemo(() => {
-    const present = new Set<Region>();
-    for (const item of releases) present.add(item.region);
-    const chips: { key: RegionFilter; label: string }[] = [];
-    if (present.has("english")) chips.push({ key: "english", label: "English" });
-    if (present.has("british")) chips.push({ key: "british", label: "British" });
-    if (present.has("hindi")) chips.push({ key: "hindi", label: "Hindi" });
-    const hasSouth =
-      present.has("tamil") ||
-      present.has("telugu") ||
-      present.has("malayalam") ||
-      present.has("kannada");
-    if (hasSouth) chips.push({ key: "south", label: "South Indian (All)" });
-    if (present.has("tamil")) chips.push({ key: "tamil", label: "Tamil" });
-    if (present.has("telugu")) chips.push({ key: "telugu", label: "Telugu" });
-    if (present.has("malayalam")) chips.push({ key: "malayalam", label: "Malayalam" });
-    if (present.has("kannada")) chips.push({ key: "kannada", label: "Kannada" });
+    const counts = new Map<Region, number>();
+    for (const item of releases) {
+      counts.set(item.region, (counts.get(item.region) ?? 0) + 1);
+    }
+    const chips: { key: RegionFilter; label: string; count: number }[] = [];
+    const add = (key: RegionFilter, label: string, count: number) => {
+      if (count > 0) chips.push({ key, label, count });
+    };
+    add("english", "English", counts.get("english") ?? 0);
+    add("british", "British", counts.get("british") ?? 0);
+    add("hindi", "Hindi", counts.get("hindi") ?? 0);
+    const southCount =
+      (counts.get("tamil") ?? 0) +
+      (counts.get("telugu") ?? 0) +
+      (counts.get("malayalam") ?? 0) +
+      (counts.get("kannada") ?? 0);
+    add("south", "South Indian", southCount);
+    add("tamil", "Tamil", counts.get("tamil") ?? 0);
+    add("telugu", "Telugu", counts.get("telugu") ?? 0);
+    add("malayalam", "Malayalam", counts.get("malayalam") ?? 0);
+    add("kannada", "Kannada", counts.get("kannada") ?? 0);
     return chips;
   }, [releases]);
 
@@ -785,7 +790,7 @@ const DateBar = memo(function DateBar({
   shelfCounts: { all: number; show: number; tv: number; cinema: number };
   onToggleShelf: (key: ShelfName) => void;
   onClearShelves: () => void;
-  availableRegions: { key: RegionFilter; label: string }[];
+  availableRegions: { key: RegionFilter; label: string; count: number }[];
   pickedRegions: RegionFilter[];
   onToggleRegion: (key: RegionFilter) => void;
   onClearRegions: () => void;
@@ -809,7 +814,7 @@ const DateBar = memo(function DateBar({
   const bar = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [moreDates, setMoreDates] = useState(false);
-  const [showMoreFilters, setShowMoreFilters] = useState(false);
+  const [showPlatforms, setShowPlatforms] = useState(false);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -861,11 +866,10 @@ const DateBar = memo(function DateBar({
     pickedShelves,
     pickedRegions,
     pickedPlatforms,
-    showMoreFilters,
+    showPlatforms,
   ]);
 
   const hasTodayInDays = days.some((d) => d.key === todayKey);
-  const extraFiltersCount = pickedRegions.length + pickedPlatforms.length;
 
   return (
     <div
@@ -915,12 +919,12 @@ const DateBar = memo(function DateBar({
             Sort: {sortMode === "rating" ? "Top rated ★" : "A–Z"}
           </SmallPill>
           <SmallPill
-            active={showMoreFilters || extraFiltersCount > 0}
-            onClick={() => setShowMoreFilters((v) => !v)}
+            active={showPlatforms || pickedPlatforms.length > 0}
+            onClick={() => setShowPlatforms((v) => !v)}
           >
-            Languages & Platforms
-            {extraFiltersCount > 0 ? ` (${extraFiltersCount})` : ""}{" "}
-            {showMoreFilters ? "▴" : "▾"}
+            Platforms
+            {pickedPlatforms.length > 0 ? ` (${pickedPlatforms.length})` : ""}{" "}
+            {showPlatforms ? "▴" : "▾"}
           </SmallPill>
           {hasActiveFilters ? (
             <button
@@ -996,58 +1000,55 @@ const DateBar = memo(function DateBar({
         </div>
       </div>
 
-      {/* Expandable Language & Platform Rows */}
-      {showMoreFilters ? (
-        <div className="mt-2.5 space-y-2 border-t border-line/70 pt-2.5">
-          {availableRegions.length > 0 ? (
-            <div className="flex items-center gap-3">
-              <span className="w-12 shrink-0 text-xs font-medium tracking-wide text-muted uppercase">
-                Lang
-              </span>
-              <div className="flex gap-1.5 overflow-x-auto overflow-y-hidden">
-                <SmallPill
-                  active={pickedRegions.length === 0}
-                  onClick={onClearRegions}
-                >
-                  All languages
-                </SmallPill>
-                {availableRegions.map((reg) => (
-                  <SmallPill
-                    key={reg.key}
-                    active={pickedRegions.includes(reg.key)}
-                    onClick={() => onToggleRegion(reg.key)}
-                  >
-                    {reg.label}
-                  </SmallPill>
-                ))}
-              </div>
-            </div>
-          ) : null}
+      {/* Language / Region Row (Always Visible) */}
+      {availableRegions.length > 0 ? (
+        <div className="mt-2 flex items-center gap-3">
+          <span className="w-12 shrink-0 text-xs font-medium tracking-wide text-muted uppercase">
+            Lang
+          </span>
+          <div className="flex gap-1.5 overflow-x-auto overflow-y-hidden">
+            <SmallPill
+              active={pickedRegions.length === 0}
+              onClick={onClearRegions}
+            >
+              All
+            </SmallPill>
+            {availableRegions.map((reg) => (
+              <SmallPill
+                key={reg.key}
+                active={pickedRegions.includes(reg.key)}
+                onClick={() => onToggleRegion(reg.key)}
+              >
+                {reg.label} ({reg.count})
+              </SmallPill>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
-          {availablePlatforms.length > 0 ? (
-            <div className="flex items-center gap-3">
-              <span className="w-12 shrink-0 text-xs font-medium tracking-wide text-muted uppercase">
-                Where
-              </span>
-              <div className="flex gap-1.5 overflow-x-auto overflow-y-hidden">
-                <SmallPill
-                  active={pickedPlatforms.length === 0}
-                  onClick={onClearPlatforms}
-                >
-                  All platforms
-                </SmallPill>
-                {availablePlatforms.map((plat) => (
-                  <SmallPill
-                    key={plat.name}
-                    active={pickedPlatforms.includes(plat.name)}
-                    onClick={() => onTogglePlatform(plat.name)}
-                  >
-                    {plat.name} ({plat.count})
-                  </SmallPill>
-                ))}
-              </div>
-            </div>
-          ) : null}
+      {/* Expandable Platform Row */}
+      {showPlatforms && availablePlatforms.length > 0 ? (
+        <div className="mt-2 flex items-center gap-3 border-t border-line/70 pt-2">
+          <span className="w-12 shrink-0 text-xs font-medium tracking-wide text-muted uppercase">
+            Where
+          </span>
+          <div className="flex gap-1.5 overflow-x-auto overflow-y-hidden">
+            <SmallPill
+              active={pickedPlatforms.length === 0}
+              onClick={onClearPlatforms}
+            >
+              All platforms
+            </SmallPill>
+            {availablePlatforms.map((plat) => (
+              <SmallPill
+                key={plat.name}
+                active={pickedPlatforms.includes(plat.name)}
+                onClick={() => onTogglePlatform(plat.name)}
+              >
+                {plat.name} ({plat.count})
+              </SmallPill>
+            ))}
+          </div>
         </div>
       ) : null}
     </div>

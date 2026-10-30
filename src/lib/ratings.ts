@@ -1,38 +1,9 @@
 import { createServerFn } from "@tanstack/react-start";
+import { readJinaText } from "./catalogue-build.ts";
 import { getCachedRating, isImdbId, primeRatingCache } from "./rating-cache.ts";
 
 export type LiveRatings = Record<string, string | null>;
 export { primeRatingCache };
-
-async function readRatingFromImdbHtml(tt: string): Promise<string | null | undefined> {
-  try {
-    const response = await fetch(`https://www.imdb.com/title/${tt}/`, {
-      headers: {
-        accept: "text/html,application/xhtml+xml",
-        "accept-language": "en-US,en;q=0.9",
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!response.ok) return undefined;
-    const html = await response.text();
-    const ldMatch = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/i);
-    if (ldMatch) {
-      const parsed = JSON.parse(ldMatch[1]) as {
-        aggregateRating?: { ratingValue?: number | string };
-      };
-      const val = parsed?.aggregateRating?.ratingValue;
-      if (val !== undefined && val !== null) {
-        return Number(val).toFixed(1);
-      }
-      return null;
-    }
-  } catch {
-    // Fall through to OMDb / Jina fallback.
-  }
-  return undefined;
-}
 
 async function readRatingFromOmdb(tt: string): Promise<string | null | undefined> {
   try {
@@ -57,15 +28,7 @@ async function readRatingFromOmdb(tt: string): Promise<string | null | undefined
 }
 
 async function readRatingFromJina(tt: string): Promise<string | null> {
-  const response = await fetch(
-    `https://r.jina.ai/https://www.imdb.com/title/${tt}/`,
-    {
-      headers: { accept: "text/plain", "user-agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(12000),
-    },
-  );
-  if (!response.ok) throw new Error(String(response.status));
-  const text = await response.text();
+  const text = await readJinaText(`https://www.imdb.com/title/${tt}/`, 12000);
   const title = text.match(/^Title:\s*(.+)$/m)?.[1] ?? "";
   const score = title.match(/⭐\s*(\d\.\d)/);
   if (score) return score[1];
@@ -77,12 +40,6 @@ async function readRating(tt: string): Promise<string | null> {
   const cached = getCachedRating(tt);
   if (cached !== undefined) {
     return cached;
-  }
-
-  const fromHtml = await readRatingFromImdbHtml(tt);
-  if (fromHtml !== undefined) {
-    primeRatingCache(tt, fromHtml);
-    return fromHtml;
   }
 
   const fromOmdb = await readRatingFromOmdb(tt);
@@ -99,7 +56,7 @@ async function readRating(tt: string): Promise<string | null> {
 /** Current IMDb scores for the given title ids. null means IMDb has no score. */
 export const getLiveRatings = createServerFn({ method: "POST" })
   .validator((data: { ids: string[] }) => ({
-    ids: (data?.ids ?? []).filter(isImdbId).slice(0, 16),
+    ids: (data?.ids ?? []).filter(isImdbId).slice(0, 12),
   }))
   .handler(async ({ data }): Promise<LiveRatings> => {
     const ratings: LiveRatings = {};

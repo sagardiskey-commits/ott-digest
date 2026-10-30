@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import {
   parseCalendar,
   parseIndianHeadings,
+  parseIndianHtmlPage,
   parseIndianTable,
+  parseTvMovies,
   safeCountry,
   safeTimeZone,
   windowBounds,
@@ -48,7 +50,25 @@ describe("catalogue-build helpers", () => {
     assert.equal(hits[0].onMovie, true);
   });
 
-  it("parses Indian OTT tables and headings", () => {
+  it("parses TV Movies with both Releases and Expected dates", () => {
+    const sample = [
+      "#### [1. Pining for Douglas](https://www.imdb.com/title/tt40384472/?ref_=sr_t_1)",
+      "    * Expected Oct 30, 2026",
+      "    * TV Movie",
+      "#### [2. Adopting St. Nick](https://www.imdb.com/title/tt43749818/?ref_=sr_t_2)",
+      "    * Releases Oct 31, 2026",
+      "    * TV Movie",
+    ].join("\n");
+
+    const movies = parseTvMovies(sample);
+    assert.equal(movies.length, 2);
+    assert.equal(movies[0].tt, "tt40384472");
+    assert.equal(movies[0].date, "2026-10-30");
+    assert.equal(movies[1].tt, "tt43749818");
+    assert.equal(movies[1].date, "2026-10-31");
+  });
+
+  it("parses Indian OTT tables, headings, and direct HTML pages", () => {
     const tableMd = [
       "| Movie / Series | Type | Language | OTT Platform | Release Date |",
       "| --- | --- | --- | --- | --- |",
@@ -83,5 +103,29 @@ describe("catalogue-build helpers", () => {
       platform: "JioHotstar",
       date: "2026-10-02",
     });
+
+    const htmlSample = `
+      <table>
+        <tr><th>Movie / Series</th><th>Type</th><th>Language</th><th>OTT Platform</th><th>Streaming Date</th></tr>
+        <tr><td>Mirzapur The Movie</td><td>Movie</td><td>Hindi</td><td>Prime Video</td><td>October 30, 2026</td></tr>
+      </table>
+      <article class="am-ott-month-card">
+        <div class="am-ott-month-info">
+          <h4><a href="https://www.keralatv.in/ott-release-guide/blind-game/">Blind Game</a></h4>
+          <div class="am-ott-month-meta">Movie · Original: Hindi</div>
+          <div class="am-ott-month-platforms"><strong>ZEE5</strong></div>
+        </div>
+        <div class="am-ott-month-side">
+          <span class="am-ott-month-countdown" data-month-date="2026-11-04">In 5 days</span>
+        </div>
+      </article>
+    `;
+    const htmlRows = parseIndianHtmlPage(htmlSample);
+    assert.equal(htmlRows.length, 2);
+    assert.equal(htmlRows[0].title, "Mirzapur The Movie");
+    assert.equal(htmlRows[0].date, "2026-10-30");
+    assert.equal(htmlRows[1].title, "Blind Game");
+    assert.equal(htmlRows[1].date, "2026-11-04");
+    assert.equal(htmlRows[1].region, "hindi");
   });
 });
